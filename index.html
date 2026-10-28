@@ -85,10 +85,14 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
 .day.sel.full i{background:var(--green);border-color:var(--bg)}
 
 /* rows */
-.row{display:flex;align-items:center;gap:14px;padding-block:16px;border-bottom:1px solid var(--fg);position:relative}
+.sw{position:relative;overflow:hidden;border-bottom:1px solid var(--fg)}
+.sw-act{position:absolute;top:0;right:0;bottom:0;width:96px;display:grid;place-items:center;font:600 10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;background:var(--red);color:var(--bg)}
+.sw-act.skip{background:var(--fg);color:var(--bg)}
+.row{display:flex;align-items:center;gap:14px;padding-block:16px;position:relative;background:var(--bg);touch-action:pan-y;transition:transform .2s}
 .chk{flex:none;width:26px;height:26px;border:1px solid var(--fg);display:grid;place-items:center;color:transparent}
 .chk svg{width:14px;height:14px}
 .done .chk{background:var(--green);border-color:var(--green);color:#fff}
+.chk:disabled{opacity:.3;cursor:not-allowed}
 .rb{flex:1;min-width:0;text-align:left;display:flex;flex-direction:column;gap:6px}
 .t{font:600 17px/1.2 var(--display);letter-spacing:-.015em;overflow-wrap:anywhere}
 .done .t{color:var(--muted);text-decoration:line-through}
@@ -163,6 +167,7 @@ textarea.paste{width:100%;height:84px;border:1px solid var(--fg);background:tran
 .note{border:1px solid var(--fg);padding:14px;margin-top:20px;font:400 11px/1.5 var(--mono);letter-spacing:.04em}
 .toast{position:fixed;left:50%;top:calc(10px + env(safe-area-inset-top,0px));transform:translate(-50%,-110px);background:var(--fg);color:var(--bg);padding:11px 16px;font:500 11px/1.2 var(--mono);letter-spacing:.1em;text-transform:uppercase;z-index:40;transition:transform .25s;max-width:92vw;text-align:center}
 .toast.on{transform:translate(-50%,0)}
+.toast button{margin-left:14px;text-decoration:underline;text-underline-offset:3px;font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit;padding:4px 0}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
@@ -221,15 +226,34 @@ const uid=()=>Math.random().toString(36).slice(2,10);
 
 /* ---------- state ---------- */
 let S=load();
+// Приводит данные к ожидаемой форме. Бросает ошибку, если это не бэкап Do Chain.
+function normalize(s){
+  const D=/^\d{4}-\d{2}-\d{2}$/,F=['none','daily','weekly','monthly','yearly'];
+  if(!s||!Array.isArray(s.tasks)||!Array.isArray(s.log))throw new Error('format');
+  const seen=new Set(),tasks=[];
+  s.tasks.forEach(t=>{
+    if(!t||typeof t.title!=='string'||!t.title.trim()||!PR.includes(t.prio)||!D.test(t.start)||!t.repeat||!F.includes(t.repeat.freq))return;
+    let id=typeof t.id==='string'&&t.id?t.id:uid();if(seen.has(id))id=uid();seen.add(id);
+    const n=Math.min(99,Math.max(1,parseInt(t.repeat.interval)||1));
+    const days=Array.isArray(t.repeat.days)?[...new Set(t.repeat.days.filter(d=>Number.isInteger(d)&&d>=0&&d<=6))]:[];
+    tasks.push({id,title:t.title.trim().slice(0,200),prio:t.prio,start:t.start,created:D.test(t.created)?t.created:t.start,until:D.test(t.until)?t.until:undefined,repeat:{freq:t.repeat.freq,interval:n,days}});
+  });
+  if(s.tasks.length&&!tasks.length)throw new Error('no valid tasks');
+  const log=s.log.filter(l=>l&&typeof l.id==='string'&&D.test(l.o)&&D.test(l.d)&&PR.includes(l.p))
+    .map(l=>({id:l.id,o:l.o,d:l.d,p:l.p,title:String(l.title||'').slice(0,200),r:String(l.r||'').slice(0,100)}));
+  const skips=(Array.isArray(s.skips)?s.skips:[]).filter(k=>k&&typeof k.id==='string'&&D.test(k.o)).map(k=>({id:k.id,o:k.o}));
+  const m=s.motto&&typeof s.motto.text==='string'&&D.test(s.motto.date)?{date:s.motto.date,text:s.motto.text.slice(0,300),custom:!!s.motto.custom}:null;
+  return {tasks,log,skips,motto:m};
+}
 function load(){
-  try{const r=localStorage.getItem(KEY);if(r){const s=JSON.parse(r);if(s&&s.tasks)return s}}catch(e){}
+  try{const r=localStorage.getItem(KEY);if(r){try{return normalize(JSON.parse(r))}catch(e){try{localStorage.setItem(KEY+'.broken',r)}catch(_){}}}}catch(e){}
   const t=today(),R=(f,i,d)=>({freq:f,interval:i||1,days:d||[]});
   return {tasks:[
     {id:uid(),title:'Главная задача дня (пример)',prio:'S',start:t,created:t,repeat:R('none')},
     {id:uid(),title:'Зарядка',prio:'B',start:t,created:t,repeat:R('daily')},
     {id:uid(),title:'Разбор почты',prio:'C',start:t,created:t,repeat:R('weekly',1,[1,2,3,4,5])},
     {id:uid(),title:'Обзор недели',prio:'A',start:t,created:t,repeat:R('weekly',1,[parse(t).getDay()])}
-  ],log:[],motto:null};
+  ],log:[],skips:[],motto:null};
 }
 function save(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}}
 try{navigator.storage&&navigator.storage.persist&&navigator.storage.persist()}catch(e){}
@@ -274,19 +298,56 @@ function repeatLabel(t){
   return '';
 }
 const isDone=(id,occ)=>S.log.some(l=>l.id===id&&l.o===occ);
+const isSkipped=(id,occ)=>S.skips.some(k=>k.id===id&&k.o===occ);
 function dayItems(date){
   const out=[];
   S.tasks.forEach(t=>{
     if(occurs(t,date))out.push({t,occ:date,late:false});
-    else if(date===today()&&t.repeat.freq==='none'&&t.start<date&&!S.log.some(l=>l.id===t.id))out.push({t,occ:t.start,late:true});
   });
   out.sort((a,b)=>PR.indexOf(a.t.prio)-PR.indexOf(b.t.prio));
   return out;
 }
-function toggle(id,occ){
+// Пропущенные: разовые без отметки и повторы за последние 7 дней, которые не выполнены и не отклонены.
+function missedItems(){
+  const t0=today(),out=[];
+  S.tasks.forEach(t=>{
+    if(t.repeat.freq==='none'){
+      if(t.start<t0&&!S.log.some(l=>l.id===t.id)&&!isSkipped(t.id,t.start))out.push({t,occ:t.start});
+    }else for(let i=1;i<=7;i++){
+      const d=addDays(t0,-i);
+      if(d>=t.created&&occurs(t,d)&&!isDone(t.id,d)&&!isSkipped(t.id,d))out.push({t,occ:d});
+    }
+  });
+  return out.sort((a,b)=>PR.indexOf(a.t.prio)-PR.indexOf(b.t.prio)||(a.occ<b.occ?1:-1));
+}
+// Честная неделя: сколько вхождений было запланировано и сколько из них закрыто (в том числе позже).
+function weekStats(){
+  const t0=today();let planned=0,done=0,missed=0;
+  for(let i=0;i<7;i++){
+    const d=addDays(t0,-i);
+    S.tasks.forEach(t=>{
+      if(d<t.created||!occurs(t,d))return;
+      if(isDone(t.id,d)){planned++;done++}
+      else if(d<t0){planned++;missed++}
+    });
+  }
+  return {planned,done,missed};
+}
+function deleteTask(id){
+  const idx=S.tasks.findIndex(x=>x.id===id);if(idx<0)return;
+  const [removed]=S.tasks.splice(idx,1);save();render();
+  toast('Задача удалена','Отменить',()=>{S.tasks.splice(Math.min(idx,S.tasks.length),0,removed);save();render()});
+}
+function skipOcc(id,occ){
+  S.skips.push({id,o:occ});save();render();
+  toast('Пропущено','Отменить',()=>{S.skips=S.skips.filter(k=>!(k.id===id&&k.o===occ));save();render()});
+}
+// late: отметка пропущенного делается сегодня; иначе дата выполнения равна дню, за который отмечаем.
+function toggle(id,occ,late){
+  if(occ>today())return;
   const i=S.log.findIndex(l=>l.id===id&&l.o===occ);
   if(i>=0)S.log.splice(i,1);
-  else{const t=S.tasks.find(x=>x.id===id);S.log.push({id,o:occ,d:today(),p:t.prio,title:t.title,r:repeatLabel(t)||'разово'});try{navigator.vibrate&&navigator.vibrate(8)}catch(e){}}
+  else{const t=S.tasks.find(x=>x.id===id);S.log.push({id,o:occ,d:late?today():occ,p:t.prio,title:t.title,r:repeatLabel(t)||'разово'});try{navigator.vibrate&&navigator.vibrate(8)}catch(e){}}
   save();render();
 }
 
@@ -303,21 +364,33 @@ function motto(){
 /* ---------- UI ---------- */
 let tab='day',viewDate=today(),editing=null,mottoEdit=false;
 const app=document.getElementById('app');
-function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('on');clearTimeout(toast.h);toast.h=setTimeout(()=>t.classList.remove('on'),2200)}
+function toast(m,label,fn){
+  const t=document.getElementById('toast');t.textContent='';
+  const s=document.createElement('span');s.textContent=m;t.append(s);
+  if(label){const b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=()=>{t.classList.remove('on');fn()};t.append(b)}
+  t.classList.add('on');clearTimeout(toast.h);toast.h=setTimeout(()=>t.classList.remove('on'),label?5000:2200);
+}
 const head=(kicker,right='')=>`<header class="head pad"><span class="lbl">${kicker}</span>${right}</header>`;
 const dateKicker=()=>parse(viewDate).toLocaleDateString('ru-RU',{weekday:'short',day:'numeric',month:'short'}).replace(/\./g,'');
 
-function row(it){
-  const {t,occ,late}=it,done=isDone(t.id,occ),rl=repeatLabel(t);
-  return `<div class="row pad ${done?'done':''}">
-    <button class="chk" data-act="tg" data-id="${t.id}" data-occ="${occ}" aria-label="${done?'Снять отметку':'Выполнено'}" aria-pressed="${done}">${CHECK}</button>
+// Строка со скрытой кнопкой за свайпом влево: «Удалить» или (для пропущенных) «Пропустить».
+function swipeWrap(inner,id,kind,occ){
+  const act=kind==='skip'
+    ?`<button class="sw-act skip" data-act="skip" data-id="${id}" data-occ="${occ}">Пропустить</button>`
+    :`<button class="sw-act" data-act="swdel" data-id="${id}">Удалить</button>`;
+  return `<div class="sw">${act}${inner}</div>`;
+}
+function row(it,missed){
+  const {t,occ}=it,done=isDone(t.id,occ),rl=repeatLabel(t),future=occ>today();
+  return swipeWrap(`<div class="row pad ${done?'done':''}">
+    <button class="chk" data-act="tg" data-id="${t.id}" data-occ="${occ}" ${missed?'data-late="1"':''} ${future?'disabled':''} aria-label="${future?'Будущую задачу отметить нельзя':done?'Снять отметку':'Выполнено'}" aria-pressed="${done}">${CHECK}</button>
     <button class="rb" data-act="edit" data-id="${t.id}"><span class="t">${esc(t.title)}</span>
-      ${(rl||late)?`<span class="m">${rl?'<span>↻ '+esc(rl)+'</span>':''}${late?'<span class="late">просрочено '+ddmm(occ)+'</span>':''}</span>`:''}</button>
-    <span class="pr" data-p="${t.prio}" title="${PR_NAME[t.prio]}">${t.prio}</span></div>`;
+      ${(rl||missed)?`<span class="m">${rl?'<span>↻ '+esc(rl)+'</span>':''}${missed?'<span class="late">пропущено '+ddmm(occ)+'</span>':''}</span>`:''}</button>
+    <span class="pr" data-p="${t.prio}" title="${PR_NAME[t.prio]}">${t.prio}</span></div>`,t.id,missed?'skip':'del',occ);
 }
 
 function renderDay(){
-  const t0=today(),items=dayItems(viewDate),done=items.filter(i=>isDone(i.t.id,i.occ)).length;
+  const t0=today(),items=dayItems(viewDate),miss=viewDate===t0?missedItems():[],done=items.filter(i=>isDone(i.t.id,i.occ)).length;
   const pct=items.length?Math.round(done/items.length*100):0,isT=viewDate===t0;
   const ws=weekStart(viewDate),cells=[];
   for(let i=0;i<7;i++){
@@ -332,15 +405,16 @@ function renderDay(){
   <section class="prog pad"><div class="big">${done}<small>/${items.length}</small></div>
     <div class="bar"><span class="lbl m">Выполнено · ${pct}%</span><div class="track"><i style="width:${pct}%"></i></div></div></section>
   <div class="week"><button class="wnav" data-act="wprev" aria-label="Прошлая неделя">‹</button>${cells.join('')}<button class="wnav" data-act="wnext" aria-label="Следующая неделя">›</button></div>
-  ${items.length?items.map(row).join(''):`<div class="empty pad"><b>На этот день задач нет.</b><span class="lbl m">Нажми «+ Задача»</span></div>`}`;
+  ${miss.length?`<div class="sec pad lbl m">Пропущено · ${miss.length} · свайп влево, чтобы пропустить</div>${miss.map(i=>row(i,true)).join('')}<div class="sec pad lbl m">На сегодня · ${items.length}</div>`:''}
+  ${items.length?items.map(i=>row(i)).join(''):`<div class="empty pad"><b>На этот день задач нет.</b><span class="lbl m">Нажми «+ Задача»</span></div>`}`;
   if(mottoEdit){const m=document.getElementById('motto');m.focus();const r=document.createRange();r.selectNodeContents(m);const s=getSelection();s.removeAllRanges();s.addRange(r)}
 }
 
 function renderAll(){
   const sorted=S.tasks.slice().sort((a,b)=>PR.indexOf(a.prio)-PR.indexOf(b.prio)||a.title.localeCompare(b.title));
   const rec=sorted.filter(t=>t.repeat.freq!=='none'),one=sorted.filter(t=>t.repeat.freq==='none');
-  const li=t=>`<div class="row pad"><span class="pr" data-p="${t.prio}">${t.prio}</span>
-    <button class="rb" data-act="edit" data-id="${t.id}"><span class="t">${esc(t.title)}</span><span class="m"><span>с ${ddmm(t.start)}</span>${repeatLabel(t)?'<span>↻ '+esc(repeatLabel(t))+'</span>':''}${t.until?'<span>до '+ddmm(t.until)+'</span>':''}</span></button></div>`;
+  const li=t=>swipeWrap(`<div class="row pad"><span class="pr" data-p="${t.prio}">${t.prio}</span>
+    <button class="rb" data-act="edit" data-id="${t.id}"><span class="t">${esc(t.title)}</span><span class="m"><span>с ${ddmm(t.start)}</span>${repeatLabel(t)?'<span>↻ '+esc(repeatLabel(t))+'</span>':''}${t.until?'<span>до '+ddmm(t.until)+'</span>':''}</span></button></div>`,t.id,'del');
   app.innerHTML=`${head('Все задачи',`<span class="lbl m">${S.tasks.length}</span>`)}
     <div class="sec pad lbl m">Повторяющиеся · ${rec.length}</div>${rec.length?rec.map(li).join(''):'<div class="empty pad"><span class="lbl m">Пока нет</span></div>'}
     <div class="sec pad lbl m">Разовые · ${one.length}</div>${one.length?one.map(li).join(''):'<div class="empty pad"><span class="lbl m">Пока нет</span></div>'}`;
@@ -367,8 +441,7 @@ const standalone=()=>window.navigator.standalone===true||matchMedia('(display-mo
 function renderStats(){
   const days=dailyStats(30),week=days.slice(-7);
   const xp=S.log.reduce((s,l)=>s+XP[l.p],0),level=Math.floor(Math.sqrt(xp/5))+1;
-  const wp=week.reduce((s,d)=>s+d.planned,0),wd=week.reduce((s,d)=>s+Math.min(d.done,d.planned||d.done),0);
-  const rate=wp?Math.round(Math.min(100,wd/wp*100)):0;
+  const hw=weekStats(),rate=hw.planned?Math.round(hw.done/hw.planned*100):0;
   const max=Math.max(3,...days.map(d=>d.done)),W=640,H=140,bw=W/30;
   const bars=days.map((d,i)=>{const h=Math.round(d.done/max*H),x=i*bw+2;
     return `<rect x="${x}" y="${H-h}" width="${bw-4}" height="${Math.max(h,d.done?3:0)}" fill="var(--fg)" opacity="${d.date===today()?1:.55}"/>`}).join('');
@@ -381,6 +454,8 @@ function renderStats(){
       <div class="tile"><b>${streak()}</b><span class="lbl m">Серия дней</span></div>
       <div class="tile"><b>${rate}%</b><span class="lbl m">План за 7 дней</span></div>
       <div class="tile"><b>${xp}</b><span class="lbl m">XP · ур. ${level}</span></div>
+      <div class="tile"><b>${hw.missed}</b><span class="lbl m">Пропущено за 7 дней</span></div>
+      <div class="tile"><b>${S.log.length}</b><span class="lbl m">Выполнено всего</span></div>
     </div>
     <section class="block pad"><div class="lbl m">Выполнено по дням</div>
       <svg class="chart" viewBox="0 -4 ${W} ${H+26}" role="img" aria-label="График выполненных задач за 30 дней"><line x1="0" x2="${W}" y1="${H}" y2="${H}" stroke="var(--fg)"/>${bars}${ticks}</svg></section>
@@ -485,9 +560,10 @@ async function saveFile(name,text,mime){
 
 /* ---------- events ---------- */
 document.addEventListener('click',e=>{
+  if(Date.now()-suppressClick<400&&e.target.closest('.sw .row'))return;
   const b=e.target.closest('[data-act]');if(!b)return;
   const a=b.dataset.act;
-  if(a==='tg')toggle(b.dataset.id,b.dataset.occ);
+  if(a==='tg')toggle(b.dataset.id,b.dataset.occ,b.dataset.late==='1');
   else if(a==='edit')openEditor(b.dataset.id);
   else if(a==='pick'){viewDate=b.dataset.d;render()}
   else if(a==='now'){viewDate=today();render()}
@@ -501,19 +577,18 @@ document.addEventListener('click',e=>{
   }
   else if(a==='close')closeEditor();
   else if(a==='save')saveEditor();
-  else if(a==='delete'){
-    if(b.dataset.armed){S.tasks=S.tasks.filter(x=>x.id!==editing);save();closeEditor();render();toast('Удалено')}
-    else{b.dataset.armed='1';b.textContent='Нажми ещё раз';setTimeout(()=>{if(b.isConnected){delete b.dataset.armed;b.textContent='Удалить задачу'}},3000)}
-  }
+  else if(a==='delete'){const id=editing;closeEditor();deleteTask(id)}
+  else if(a==='swdel')deleteTask(b.dataset.id);
+  else if(a==='skip')skipOcc(b.dataset.id,b.dataset.occ);
   else if(a==='ex-daily')saveFile('dochain-daily-'+today()+'.csv',toCsv(['date','planned','done','xp'],dailyStats(90).map(x=>[x.date,x.planned,x.done,x.xp])),'text/csv');
   else if(a==='ex-log')saveFile('dochain-history-'+today()+'.csv',toCsv(['completed_on','occurrence','priority','title','repeat'],S.log.map(l=>[l.d,l.o,l.p,l.title,l.r||''])),'text/csv');
   else if(a==='ex-json')saveFile('dochain-backup-'+today()+'.json',JSON.stringify(S,null,2),'application/json');
   else if(a==='import'){
-    try{const s=JSON.parse(document.getElementById('imp').value);if(!s||!Array.isArray(s.tasks)||!Array.isArray(s.log))throw 0;S=s;save();render();toast('Данные восстановлены')}
-    catch(x){toast('Не удалось прочитать JSON')}
+    try{S=normalize(JSON.parse(document.getElementById('imp').value));save();render();toast('Импорт: '+S.tasks.length+' задач, '+S.log.length+' отметок')}
+    catch(x){toast('Это не резервная копия Do Chain')}
   }
   else if(a==='reset'){
-    if(b.dataset.armed){S={tasks:[],log:[],motto:null};save();render();toast('Данные удалены')}
+    if(b.dataset.armed){S={tasks:[],log:[],skips:[],motto:null};save();render();toast('Данные удалены')}
     else{b.dataset.armed='1';b.textContent='Точно? Нажми ещё раз';setTimeout(()=>{if(b.isConnected){delete b.dataset.armed;b.textContent='Удалить все данные'}},3000)}
   }
 });
@@ -522,12 +597,50 @@ document.querySelectorAll('.tab[data-tab]').forEach(b=>b.onclick=()=>{
   tab=b.dataset.tab;document.querySelectorAll('.tab[data-tab]').forEach(x=>x.setAttribute('aria-selected',x===b));
   mottoEdit=false;render();scrollTo(0,0);
 });
+// свайп строки влево: открывает «Удалить» / «Пропустить»; тап по открытой строке закрывает её
+const SW=96;let swS=null,swOpen=null,suppressClick=0;
+const closeSwipe=()=>{if(swOpen){const r=swOpen.querySelector('.row');if(r)r.style.transform='';swOpen=null}};
+app.addEventListener('touchstart',e=>{
+  const row=e.target.closest('.sw>.row');
+  if(swOpen&&(!row||row.parentElement!==swOpen))closeSwipe();
+  if(!row)return;
+  const t=e.touches[0];
+  swS={row,x:t.clientX,y:t.clientY,base:row.parentElement===swOpen?-SW:0,dx:0,lock:null};
+  row.style.transition='none';
+},{passive:true});
+app.addEventListener('touchmove',e=>{
+  if(!swS)return;
+  const t=e.touches[0],dx=t.clientX-swS.x,dy=t.clientY-swS.y;
+  if(swS.lock===null){
+    if(Math.abs(dx)<8&&Math.abs(dy)<8)return;
+    swS.lock=Math.abs(dx)>Math.abs(dy)*1.2?'x':'y';
+  }
+  if(swS.lock!=='x')return;
+  swS.dx=dx;
+  swS.row.style.transform=`translateX(${Math.max(-SW*1.3,Math.min(0,swS.base+dx))}px)`;
+},{passive:true});
+const swEnd=()=>{
+  if(!swS)return;
+  const {row,base,dx,lock}=swS;swS=null;row.style.transition='';
+  const wrap=row.parentElement;
+  if(lock!=='x'){
+    if(base&&lock===null){row.style.transform='';swOpen=null;suppressClick=Date.now()}
+    else row.style.transform=base?`translateX(${-SW}px)`:'';
+    return;
+  }
+  suppressClick=Date.now();
+  if(base+dx<-SW/2){row.style.transform=`translateX(${-SW}px)`;swOpen=wrap}
+  else{row.style.transform='';if(swOpen===wrap)swOpen=null}
+};
+app.addEventListener('touchend',swEnd,{passive:true});
+app.addEventListener('touchcancel',swEnd,{passive:true});
 let sx=null;
 app.addEventListener('touchstart',e=>{if(e.target.closest('.week'))sx=e.touches[0].clientX},{passive:true});
 app.addEventListener('touchend',e=>{if(sx===null)return;const dx=e.changedTouches[0].clientX-sx;sx=null;if(Math.abs(dx)>50){viewDate=addDays(viewDate,dx<0?7:-7);render()}},{passive:true});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!editing&&!mottoEdit)render()});
 
 function render(){
+  swOpen=null;
   if(tab==='day')renderDay();else if(tab==='all')renderAll();else renderStats();
   document.getElementById('fab').hidden=tab==='stats';
 }
